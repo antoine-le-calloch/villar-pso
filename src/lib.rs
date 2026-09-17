@@ -199,17 +199,20 @@ impl VillarParams {
         map
     }
 
-    /// Return a copy with A and extra_sigma scaled back to original flux units.
-    /// `peak_flux` is the global peak used during normalisation.
     /// Return a copy with flux-unit parameters scaled back to original units.
-    /// A, beta, and extra_sigma have flux units; the rest are in days.
+    /// `peak_flux` is the global peak used during normalisation.
+    ///
+    /// Only A and extra_sigma carry flux units. beta does not: the model is
+    /// `A * (1 - beta * phase)`, so beta is a *fractional* decline rate in
+    /// day^-1 and is invariant under the flux normalisation. gamma, t_0,
+    /// tau_rise and tau_fall are in days and are likewise untouched.
     pub fn unnormalized(&self, peak_flux: f64) -> Self {
         VillarParams {
             a_r: self.a_r * peak_flux,
-            beta_r: self.beta_r * peak_flux,
+            // beta_r: self.beta_r * peak_flux,
             extra_sigma_r: self.extra_sigma_r * peak_flux,
             a_g: self.a_g * peak_flux,
-            beta_g: self.beta_g * peak_flux,
+            // beta_g: self.beta_g * peak_flux,
             extra_sigma_g: self.extra_sigma_g * peak_flux,
             ..*self
         }
