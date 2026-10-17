@@ -131,9 +131,10 @@ extern "C" __global__ void batch_pso_cost_villar_joint(
             return;
         }
 
+        // Gaussian -2 ln L minus the constant ln(flux_err^2); see pso_cost in lib.rs.
         double sigma2 = all_flux_err_sq[i] + extra_sig * extra_sig;
         double diff = all_flux[i] - model;
-        double contrib = diff * diff / sigma2;
+        double contrib = diff * diff / sigma2 + log(sigma2 / all_flux_err_sq[i]);
 
         if (band == 0) {
             ll_r += contrib;

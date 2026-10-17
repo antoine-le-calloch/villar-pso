@@ -2,7 +2,8 @@
 //!
 //! Matches the preprocessing and model from `fit_jax_best.py` exactly.
 //! Replaces NumPyro SVI with Particle Swarm Optimisation over the 14-parameter
-//! space (7 r-band + 7 g-band), minimising reduced chi-squared.
+//! space (7 r-band + 7 g-band), minimising a band-balanced Gaussian negative
+//! log-likelihood plus prior penalty ([`pso_cost`]).
 
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -129,12 +130,26 @@ pub fn offsets_to_absolute(raw: &[f64; N_PARAMS]) -> [f64; N_PARAMS] {
 
 // ─── Photometry helpers ──────────────────────────────────────────────────────
 
+/// AB zeropoint of the internal flux scale: AB mag 23.9 ↔ 1 µJy, so every
+/// un-normalised flux in this crate is in microjanskys.
+pub const AB_ZP: f64 = 23.9;
+
 /// Convert magnitude + error to flux + flux_error (zeropoint = 23.9).
 pub fn mag_to_flux(mag: f64, mag_err: f64) -> (f64, f64) {
-    let zp = 23.9;
-    let flux = ((zp - mag) / 2.5 * std::f64::consts::LN_10).exp();
+    let flux = ((AB_ZP - mag) / 2.5 * std::f64::consts::LN_10).exp();
     let flux_err = flux * mag_err * std::f64::consts::LN_10 / 2.5;
     (flux, flux_err)
+}
+
+/// Inverse of [`mag_to_flux`]: flux + flux_error (µJy) → AB mag + mag_err.
+/// Non-positive flux has no magnitude and yields NaN for both.
+pub fn flux_to_mag(flux: f64, flux_err: f64) -> (f64, f64) {
+    if !(flux > 0.0) {
+        return (f64::NAN, f64::NAN);
+    }
+    let mag = AB_ZP - 2.5 * flux.log10();
+    let mag_err = 2.5 / std::f64::consts::LN_10 * flux_err / flux;
+    (mag, mag_err)
 }
 
 /// Physical Villar parameters for both bands (14 total).
@@ -216,6 +231,24 @@ impl VillarParams {
             extra_sigma_g: self.extra_sigma_g * peak_flux,
             ..*self
         }
+    }
+
+    /// Return a copy with the flux-unit parameters on the AB magnitude scale.
+    /// Call on the normalised params with the `peak_flux` used during
+    /// normalisation.
+    ///
+    /// * A → AB magnitude of the amplitude, `23.9 - 2.5 log10(A * peak_flux)`.
+    /// * extra_sigma → magnitude scatter at that amplitude,
+    ///   `2.5 / ln(10) * extra_sigma / A` (same convention as `mag_err`).
+    ///
+    /// beta, gamma, t_0, tau_rise and tau_fall are unchanged, as in
+    /// [`Self::unnormalized`].
+    pub fn to_ab_mag(&self, peak_flux: f64) -> Self {
+        let (a_r, extra_sigma_r) =
+            flux_to_mag(self.a_r * peak_flux, self.extra_sigma_r * peak_flux);
+        let (a_g, extra_sigma_g) =
+            flux_to_mag(self.a_g * peak_flux, self.extra_sigma_g * peak_flux);
+        VillarParams { a_r, extra_sigma_r, a_g, extra_sigma_g, ..*self }
     }
 }
 
@@ -539,6 +572,16 @@ fn finalize_preprocessing(mut obs: Vec<Obs>) -> Result<PreprocessedData, String>
         o.flux_err /= peak;
     }
 
+    // Sort by (band, phase) before padding, so the padding goes after ALL
+    // real points. BandIndices, reduced_chi2 and the GPU uploads treat the
+    // first `orig_size` entries as the real data; sorting after padding put
+    // the r-band padding ahead of the g band and cut off its latest points.
+    obs.sort_by(|a, b| {
+        a.band.idx()
+            .cmp(&b.band.idx())
+            .then(a.phase.partial_cmp(&b.phase).unwrap())
+    });
+
     let orig_size = obs.len();
 
     // Pad each filter to equal length (next power-of-2 / 2)
@@ -560,13 +603,6 @@ fn finalize_preprocessing(mut obs: Vec<Obs>) -> Result<PreprocessedData, String>
             });
         }
     }
-
-    // Sort by (band, phase)
-    obs.sort_by(|a, b| {
-        a.band.idx()
-            .cmp(&b.band.idx())
-            .then(a.phase.partial_cmp(&b.phase).unwrap())
-    });
 
     Ok(PreprocessedData { obs, orig_size, peak_flux: peak })
 }
@@ -717,6 +753,13 @@ impl BandIndices {
 /// raw[0..7] = r-band values, raw[7..14] = g-band offsets from r-band.
 /// Uses band-balanced likelihood so each filter contributes equally.
 /// `min_extra_sigma`: floor for extra_sigma in physical space (smooths cost landscape).
+///
+/// Each point contributes the Gaussian -2 ln L, `r²/σ² + ln σ²` with
+/// `σ² = flux_err² + extra_sigma²`, minus the parameter-independent constant
+/// `ln flux_err²`. Without the log term the cost would fall monotonically as
+/// extra_sigma grows, driving every fit to extra_sigma's prior bound.
+/// Writing it as `ln(σ² / flux_err²) >= 0` keeps the cost non-negative, which
+/// the relative stall test in the PSO loop relies on.
 pub fn pso_cost(
     raw: &[f64; N_PARAMS],
     obs: &[Obs],
@@ -745,9 +788,10 @@ pub fn pso_cost(
         if !model_flux.is_finite() {
             return 1e12;
         }
-        let sigma2 = obs[i].flux_err * obs[i].flux_err + extra_sigma * extra_sigma;
+        let err2 = obs[i].flux_err * obs[i].flux_err;
+        let sigma2 = err2 + extra_sigma * extra_sigma;
         let diff = obs[i].flux - model_flux;
-        ll_r += diff * diff / sigma2;
+        ll_r += diff * diff / sigma2 + (sigma2 / err2).ln();
     }
 
     let mut ll_g = 0.0;
@@ -757,9 +801,10 @@ pub fn pso_cost(
         if !model_flux.is_finite() {
             return 1e12;
         }
-        let sigma2 = obs[i].flux_err * obs[i].flux_err + extra_sigma * extra_sigma;
+        let err2 = obs[i].flux_err * obs[i].flux_err;
+        let sigma2 = err2 + extra_sigma * extra_sigma;
         let diff = obs[i].flux - model_flux;
-        ll_g += diff * diff / sigma2;
+        ll_g += diff * diff / sigma2 + (sigma2 / err2).ln();
     }
 
     let n_r = band_indices.r_indices.len();
@@ -946,17 +991,136 @@ pub fn pso_minimize(
     (gbest_pos, gbest_cost)
 }
 
+/// Cost-evaluation budget for [`nelder_mead_polish`] after each PSO run.
+pub const NM_MAX_EVALS: usize = 4000;
+
+/// Local Nelder-Mead refinement of a PSO optimum, clamped to `[lower, upper]`.
+///
+/// PSO's stall test stops near, but often not at, the bottom of the narrow
+/// valleys the full likelihood has once extra_sigma is free to shrink. A few
+/// thousand simplex steps from the swarm's best point close most of that gap
+/// for ~1% of the PSO's cost evaluations. Uses the dimension-adaptive
+/// coefficients of Gao & Han (2012).
+pub fn nelder_mead_polish(
+    cost_fn: &dyn Fn(&[f64; N_PARAMS]) -> f64,
+    x0: &[f64; N_PARAMS],
+    lower: &[f64; N_PARAMS],
+    upper: &[f64; N_PARAMS],
+    max_evals: usize,
+) -> ([f64; N_PARAMS], f64) {
+    let n = N_PARAMS as f64;
+    let (alpha, beta, gamma, delta) = (1.0, 1.0 + 2.0 / n, 0.75 - 0.5 / n, 1.0 - 1.0 / n);
+    let clamp = |x: &mut [f64; N_PARAMS]| {
+        for d in 0..N_PARAMS {
+            x[d] = x[d].clamp(lower[d], upper[d]);
+        }
+    };
+
+    // Initial simplex: x0 plus a 2%-of-range step along each axis (stepping
+    // inward when x0 sits on the upper bound).
+    let mut simplex: Vec<([f64; N_PARAMS], f64)> = Vec::with_capacity(N_PARAMS + 1);
+    simplex.push((*x0, cost_fn(x0)));
+    for d in 0..N_PARAMS {
+        let mut x = *x0;
+        let step = 0.02 * (upper[d] - lower[d]);
+        x[d] = if x[d] + step <= upper[d] { x[d] + step } else { x[d] - step };
+        clamp(&mut x);
+        simplex.push((x, cost_fn(&x)));
+    }
+    let mut evals = simplex.len();
+
+    while evals < max_evals {
+        simplex.sort_by(|a, b| a.1.total_cmp(&b.1));
+        if simplex[N_PARAMS].1 - simplex[0].1 < 1e-7 {
+            break;
+        }
+        let mut centroid = [0.0; N_PARAMS];
+        for v in &simplex[..N_PARAMS] {
+            for d in 0..N_PARAMS {
+                centroid[d] += v.0[d] / n;
+            }
+        }
+        let worst = simplex[N_PARAMS];
+        // Point on the line through the centroid and the worst vertex.
+        let along = |t: f64| {
+            let mut x = [0.0; N_PARAMS];
+            for d in 0..N_PARAMS {
+                x[d] = centroid[d] + t * (worst.0[d] - centroid[d]);
+            }
+            clamp(&mut x);
+            x
+        };
+
+        let xr = along(-alpha);
+        let fr = cost_fn(&xr);
+        evals += 1;
+        if fr < simplex[0].1 {
+            let xe = along(-alpha * beta);
+            let fe = cost_fn(&xe);
+            evals += 1;
+            simplex[N_PARAMS] = if fe < fr { (xe, fe) } else { (xr, fr) };
+        } else if fr < simplex[N_PARAMS - 1].1 {
+            simplex[N_PARAMS] = (xr, fr);
+        } else {
+            // Contract outside (reflection beat the worst) or inside.
+            let xc = if fr < worst.1 { along(-alpha * gamma) } else { along(gamma) };
+            let fc = cost_fn(&xc);
+            evals += 1;
+            if fc < fr.min(worst.1) {
+                simplex[N_PARAMS] = (xc, fc);
+            } else {
+                let best = simplex[0].0;
+                for v in simplex.iter_mut().skip(1) {
+                    for d in 0..N_PARAMS {
+                        v.0[d] = best[d] + delta * (v.0[d] - best[d]);
+                    }
+                    v.1 = cost_fn(&v.0);
+                }
+                evals += N_PARAMS;
+            }
+        }
+    }
+    simplex.sort_by(|a, b| a.1.total_cmp(&b.1));
+    simplex[0]
+}
+
+/// [`nelder_mead_polish`] of `raw` on one source's [`pso_cost`]. The GPU
+/// backends call this on the host after their batch PSO so that every path
+/// ends with the same f64 refinement and reports a comparable `cost`.
+#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+pub(crate) fn polish_source(
+    raw: &[f64; N_PARAMS],
+    data: &PreprocessedData,
+    priors: &PriorArrays,
+) -> ([f64; N_PARAMS], f64) {
+    let param_map = build_param_map(&data.obs);
+    let band_indices = BandIndices::new(&data.obs, data.orig_size);
+    let cost_fn = |r: &[f64; N_PARAMS]| {
+        pso_cost(r, &data.obs, &param_map, data.orig_size, priors, 0.0, &band_indices)
+    };
+    nelder_mead_polish(&cost_fn, raw, &priors.mins, &priors.maxs, NM_MAX_EVALS)
+}
+
 // ─── Top-level fit function ──────────────────────────────────────────────────
 
 pub struct FitResult {
     /// Named physical parameters (normalised).
     pub params: VillarParams,
-    /// Named physical parameters in original flux units (A, extra_sigma un-normalised).
+    /// Named physical parameters in original flux units (A, extra_sigma in µJy).
     pub params_unnorm: VillarParams,
-    /// Peak flux used for normalisation.
+    /// Named physical parameters on the AB magnitude scale (see
+    /// [`VillarParams::to_ab_mag`]).
+    pub params_mag: VillarParams,
+    /// Peak flux used for normalisation (µJy).
     pub peak_flux: f64,
+    /// `peak_flux` as an AB magnitude.
+    pub peak_mag: f64,
     /// Reduced chi-squared of the best fit.
     pub reduced_chi2: f64,
+    /// Final objective ([`pso_cost`]) after the Nelder-Mead polish; lower is
+    /// better. Multi-seed runs keep the seed with the lowest value. Not
+    /// comparable across sources.
+    pub cost: f64,
     /// Number of real observations (before padding).
     pub orig_size: usize,
     /// Preprocessed observations (unpadded kept for plotting).
@@ -990,40 +1154,42 @@ impl FitResult {
 
 /// Run the full fitting pipeline on a CSV file.
 pub fn fit_lightcurve(csv_path: &str) -> Result<FitResult, String> {
-    let data = preprocess(csv_path)?;
+    Ok(fit_preprocessed(preprocess(csv_path)?))
+}
 
+/// Run the full fitting pipeline on a slice of `PhotometryMag` structs.
+pub fn fit_photometry(data: &[PhotometryMag]) -> Result<FitResult, String> {
+    Ok(fit_preprocessed(preprocess_from_photometry(data)?))
+}
+
+/// Shared CPU fit: PSO from three seeds, each polished with Nelder-Mead,
+/// keeping the lowest polished cost.
+///
+/// All three seeds always run: seeds regularly settle in different basins of
+/// the likelihood, and an early exit on "first two agree within x% of the
+/// cost" is far too loose at this cost's scale (5% is ~10 in -2 ln L).
+fn fit_preprocessed(data: PreprocessedData) -> FitResult {
     let param_map = build_param_map(&data.obs);
     let priors = PriorArrays::new();
 
     // PSO bounds = prior mins/maxs
-    let mut lower = [0.0; N_PARAMS];
-    let mut upper = [0.0; N_PARAMS];
-    for i in 0..N_PARAMS {
-        lower[i] = priors.mins[i];
-        upper[i] = priors.maxs[i];
-    }
+    let lower = priors.mins;
+    let upper = priors.maxs;
 
     let config = PsoConfig::default();
     let band_indices = BandIndices::new(&data.obs, data.orig_size);
 
-    // Multi-seed PSO (3 seeds, skip later ones if first two agree)
     let seeds: [u64; 3] = [42, 137, 271];
     let mut best_params = [0.0; N_PARAMS];
     let mut best_cost = f64::INFINITY;
-    let mut first_cost = f64::INFINITY;
 
     let cost_fn = |raw: &[f64; N_PARAMS]| {
         pso_cost(raw, &data.obs, &param_map, data.orig_size, &priors, 0.0, &band_indices)
     };
 
-    for (i, &seed) in seeds.iter().enumerate() {
-        if i >= 2 && (first_cost - best_cost).abs() < 0.05 * best_cost.abs().max(1e-10) {
-            break;
-        }
-        let (params, cost) = pso_minimize(&cost_fn, &lower, &upper, &priors, &config, seed);
-        if i == 0 {
-            first_cost = cost;
-        }
+    for &seed in &seeds {
+        let (params, _) = pso_minimize(&cost_fn, &lower, &upper, &priors, &config, seed);
+        let (params, cost) = nelder_mead_polish(&cost_fn, &params, &lower, &upper, NM_MAX_EVALS);
         if cost < best_cost {
             best_cost = cost;
             best_params = params;
@@ -1039,71 +1205,17 @@ pub fn fit_lightcurve(csv_path: &str) -> Result<FitResult, String> {
         .collect();
 
     let vp = VillarParams::from_phys(&phys);
-    Ok(FitResult {
+    FitResult {
         params: vp,
         params_unnorm: vp.unnormalized(data.peak_flux),
+        params_mag: vp.to_ab_mag(data.peak_flux),
         peak_flux: data.peak_flux,
+        peak_mag: flux_to_mag(data.peak_flux, 0.0).0,
         reduced_chi2: rchi2,
+        cost: best_cost,
         orig_size: data.orig_size,
         obs: real_obs,
-    })
-}
-
-/// Run the full fitting pipeline on a slice of `PhotometryMag` structs.
-pub fn fit_photometry(data: &[PhotometryMag]) -> Result<FitResult, String> {
-    let data = preprocess_from_photometry(data)?;
-
-    let param_map = build_param_map(&data.obs);
-    let priors = PriorArrays::new();
-
-    let mut lower = [0.0; N_PARAMS];
-    let mut upper = [0.0; N_PARAMS];
-    for i in 0..N_PARAMS {
-        lower[i] = priors.mins[i];
-        upper[i] = priors.maxs[i];
     }
-
-    let config = PsoConfig::default();
-    let band_indices = BandIndices::new(&data.obs, data.orig_size);
-
-    let seeds: [u64; 3] = [42, 137, 271];
-    let mut best_params = [0.0; N_PARAMS];
-    let mut best_cost = f64::INFINITY;
-    let mut first_cost = f64::INFINITY;
-
-    let cost_fn = |raw: &[f64; N_PARAMS]| {
-        pso_cost(raw, &data.obs, &param_map, data.orig_size, &priors, 0.0, &band_indices)
-    };
-
-    for (i, &seed) in seeds.iter().enumerate() {
-        if i >= 2 && (first_cost - best_cost).abs() < 0.05 * best_cost.abs().max(1e-10) {
-            break;
-        }
-        let (params, cost) = pso_minimize(&cost_fn, &lower, &upper, &priors, &config, seed);
-        if i == 0 {
-            first_cost = cost;
-        }
-        if cost < best_cost {
-            best_cost = cost;
-            best_params = params;
-        }
-    }
-    let phys = to_physical(&best_params, &priors);
-    let rchi2 = reduced_chi2(&best_params, &data.obs, &param_map, data.orig_size, &priors);
-
-    let real_obs: Vec<Obs> = data.obs.into_iter()
-        .filter(|o| o.phase < 999.0 && o.flux_err < 999.0)
-        .collect();
-
-    let vp = VillarParams::from_phys(&phys);
-    Ok(FitResult {
-        params: vp,
-        params_unnorm: vp.unnormalized(data.peak_flux),
-        peak_flux: data.peak_flux,
-        reduced_chi2: rchi2,
-        orig_size: data.orig_size,
-        obs: real_obs,
-    })
 }
 
 // ─── PyO3 bindings ───────────────────────────────────────────────────────────
@@ -1134,15 +1246,26 @@ mod python_bindings {
                 params_unnorm.set_item(key, val)?;
             }
             dict.set_item("params_unnorm", params_unnorm)?;
+
+            let params_mag = PyDict::new(py);
+            for (key, val) in result.params_mag.to_named_map() {
+                params_mag.set_item(key, val)?;
+            }
+            dict.set_item("params_mag", params_mag)?;
             dict.set_item("peak_flux", result.peak_flux)?;
+            dict.set_item("peak_mag", result.peak_mag)?;
             dict.set_item("reduced_chi2", result.reduced_chi2)?;
             dict.set_item("orig_size", result.orig_size)?;
 
             let obs_list: Vec<PyObject> = result.obs.iter().map(|o| {
+                let (mag, mag_err) =
+                    flux_to_mag(o.flux * result.peak_flux, o.flux_err * result.peak_flux);
                 let d = PyDict::new(py);
                 d.set_item("phase", o.phase).unwrap();
                 d.set_item("flux", o.flux).unwrap();
                 d.set_item("flux_err", o.flux_err).unwrap();
+                d.set_item("mag", mag).unwrap();
+                d.set_item("mag_err", mag_err).unwrap();
                 d.set_item("band", o.band.idx()).unwrap();
                 d.into_any().unbind()
             }).collect();
@@ -1152,9 +1275,14 @@ mod python_bindings {
         })
     }
 
-    /// Evaluate the Villar model on a dense time grid for one filter.
-    #[pyfunction]
-    fn eval_villar(params: &Bound<'_, PyDict>, t_dense: Vec<f64>, filt: &str) -> PyResult<Vec<f64>> {
+    /// Model flux on a time grid for one filter, from a named-params dict
+    /// (keys like "A_ZTF_r"). Shared by `eval_villar` and `eval_villar_mag`.
+    fn villar_curve(
+        params: &Bound<'_, PyDict>,
+        t_dense: &[f64],
+        filt: &str,
+        amp_is_mag: bool,
+    ) -> PyResult<Vec<f64>> {
         let band = match filt {
             "ZTF_r" | "r" => Band::R,
             "ZTF_g" | "g" => Band::G,
@@ -1176,14 +1304,33 @@ mod python_bindings {
                 phys[fi * N_BASE + pi] = val;
             }
         }
+        if amp_is_mag {
+            // A is an AB magnitude; the model is linear in A, so evaluate in µJy.
+            phys[pm[0]] = mag_to_flux(phys[pm[0]], 0.0).0;
+        }
 
-        let result: Vec<f64> = t_dense.iter().map(|&t| {
+        Ok(t_dense.iter().map(|&t| {
             let dummy = Obs { phase: t, flux: 0.0, flux_err: 0.0, band };
             let (f, _) = villar_flux_at(&phys, &dummy, &pm, 0.0);
             f
-        }).collect();
+        }).collect())
+    }
 
-        Ok(result)
+    /// Evaluate the Villar model on a dense time grid for one filter.
+    /// Returns flux in the units of `params` (normalised for `params`,
+    /// µJy for `params_unnorm`).
+    #[pyfunction]
+    fn eval_villar(params: &Bound<'_, PyDict>, t_dense: Vec<f64>, filt: &str) -> PyResult<Vec<f64>> {
+        villar_curve(params, &t_dense, filt, false)
+    }
+
+    /// Evaluate the Villar model on a dense time grid for one filter, as AB
+    /// magnitudes. Takes the `params_mag` dict returned by `fit` / `fit_gpu`.
+    /// Times where the model flux is non-positive return NaN.
+    #[pyfunction]
+    fn eval_villar_mag(params_mag: &Bound<'_, PyDict>, t_dense: Vec<f64>, filt: &str) -> PyResult<Vec<f64>> {
+        let flux = villar_curve(params_mag, &t_dense, filt, true)?;
+        Ok(flux.into_iter().map(|f| flux_to_mag(f, 0.0).0).collect())
     }
 
     /// Fit one or more ZTF light curve CSVs using the GPU batch PSO.
@@ -1292,7 +1439,14 @@ mod python_bindings {
                         params_unnorm.set_item(key, val)?;
                     }
                     dict.set_item("params_unnorm", params_unnorm)?;
+
+                    let params_mag = PyDict::new(py);
+                    for (key, val) in res.params_mag.to_named_map() {
+                        params_mag.set_item(key, val)?;
+                    }
+                    dict.set_item("params_mag", params_mag)?;
                     dict.set_item("peak_flux", res.peak_flux)?;
+                    dict.set_item("peak_mag", res.peak_mag)?;
                     dict.set_item("reduced_chi2", res.reduced_chi2)?;
                     out_list.append(dict)?;
                 }
@@ -1311,6 +1465,7 @@ mod python_bindings {
     fn villar_pso(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(fit, m)?)?;
         m.add_function(wrap_pyfunction!(eval_villar, m)?)?;
+        m.add_function(wrap_pyfunction!(eval_villar_mag, m)?)?;
         #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
         m.add_function(wrap_pyfunction!(fit_gpu, m)?)?;
         Ok(())

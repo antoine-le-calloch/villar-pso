@@ -9,9 +9,10 @@ use std::ptr;
 
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
+use rayon::prelude::*;
 
 use crate::{
-    preprocess, reduced_chi2, to_physical, build_param_map,
+    preprocess, reduced_chi2, to_physical, build_param_map, flux_to_mag, polish_source,
     BandIndices, FitResult, Obs, PreprocessedData, PriorArrays, PsoConfig, VillarParams,
     N_PARAMS,
 };
@@ -344,7 +345,7 @@ impl GpuContext {
     /// The entire PSO loop (cost eval, velocity/position update, best reduction)
     /// runs on GPU. Only a small `source_done` array is downloaded each iteration
     /// for convergence checking.
-    pub fn batch_pso<S: AsRef<SourceData>>(
+    pub fn batch_pso<S: AsRef<SourceData> + Sync>(
         &self,
         data: &GpuBatchData,
         sources: &[S],
@@ -569,16 +570,19 @@ impl GpuContext {
             if all_done { break; }
         }
 
-        // Collect results from CPU-side gbest arrays
+        // Collect results from CPU-side gbest arrays, polishing each in f64
+        // on the host exactly as the CPU path does (one source per task).
         let results: Vec<FitResult> = (0..n_sources)
+            .into_par_iter()
             .map(|s| {
                 let gb = s * dim;
                 let mut raw = [0.0f64; N_PARAMS];
                 raw.copy_from_slice(&h_gbest_pos[gb..gb + dim]);
 
+                let d = &sources[s].as_ref().data;
+                let (raw, cost) = polish_source(&raw, d, &priors);
                 let phys = to_physical(&raw, &priors);
 
-                let d = &sources[s].as_ref().data;
                 let param_map = build_param_map(&d.obs);
                 let rchi2 = reduced_chi2(&raw, &d.obs, &param_map, d.orig_size, &priors);
 
@@ -591,8 +595,11 @@ impl GpuContext {
                 FitResult {
                     params,
                     params_unnorm: params.unnormalized(d.peak_flux),
+                    params_mag: params.to_ab_mag(d.peak_flux),
                     peak_flux: d.peak_flux,
+                    peak_mag: flux_to_mag(d.peak_flux, 0.0).0,
                     reduced_chi2: rchi2,
+                    cost,
                     orig_size: d.orig_size,
                     obs: real_obs,
                 }
@@ -603,8 +610,10 @@ impl GpuContext {
     }
 
     /// Run batch PSO with multiple seeds (matching CPU's 3-seed strategy).
-    /// Returns the best result per source across all seeds.
-    pub fn batch_pso_multi_seed<S: AsRef<SourceData>>(
+    /// Returns the best result per source across all seeds, judged by the
+    /// PSO cost as on the CPU path (reduced chi2 alone favours whichever seed
+    /// inflated extra_sigma most).
+    pub fn batch_pso_multi_seed<S: AsRef<SourceData> + Sync>(
         &self,
         data: &GpuBatchData,
         sources: &[S],
@@ -618,7 +627,7 @@ impl GpuContext {
             best = Some(match best {
                 None => results,
                 Some(prev) => prev.into_iter().zip(results).map(|(a, b)| {
-                    if b.reduced_chi2 < a.reduced_chi2 { b } else { a }
+                    if b.cost < a.cost { b } else { a }
                 }).collect(),
             });
         }

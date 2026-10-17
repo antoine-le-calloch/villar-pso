@@ -23,9 +23,11 @@ use metal::{
 };
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
+use rayon::prelude::*;
 
 use crate::{
-    build_param_map, preprocess, reduced_chi2, to_physical, BandIndices, FitResult, Obs,
+    build_param_map, flux_to_mag, polish_source, preprocess, reduced_chi2, to_physical, BandIndices,
+    FitResult, Obs,
     PreprocessedData, PriorArrays, PsoConfig, VillarParams, N_PARAMS,
 };
 
@@ -228,7 +230,7 @@ impl GpuContext {
     ///
     /// Cost evaluation runs on the GPU; pbest / gbest / restart logic runs on
     /// the CPU. This is the same split the CUDA path uses — see [`crate::gpu`].
-    pub fn batch_pso<S: AsRef<SourceData>>(
+    pub fn batch_pso<S: AsRef<SourceData> + Sync>(
         &self,
         data: &GpuBatchData,
         sources: &[S],
@@ -476,15 +478,19 @@ impl GpuContext {
             }
         }
 
+        // Polish each source's fp32-found optimum in f64 on the host, exactly
+        // as the CPU path does (one source per task).
         let results: Vec<FitResult> = (0..n_sources)
+            .into_par_iter()
             .map(|s| {
                 let gb = s * dim;
                 let mut raw = [0.0f64; N_PARAMS];
                 raw.copy_from_slice(&h_gbest_pos[gb..gb + dim]);
 
+                let d = &sources[s].as_ref().data;
+                let (raw, cost) = polish_source(&raw, d, &priors);
                 let phys = to_physical(&raw, &priors);
 
-                let d = &sources[s].as_ref().data;
                 let param_map = build_param_map(&d.obs);
                 let rchi2 = reduced_chi2(&raw, &d.obs, &param_map, d.orig_size, &priors);
 
@@ -499,8 +505,11 @@ impl GpuContext {
                 FitResult {
                     params,
                     params_unnorm: params.unnormalized(d.peak_flux),
+                    params_mag: params.to_ab_mag(d.peak_flux),
                     peak_flux: d.peak_flux,
+                    peak_mag: flux_to_mag(d.peak_flux, 0.0).0,
                     reduced_chi2: rchi2,
+                    cost,
                     orig_size: d.orig_size,
                     obs: real_obs,
                 }
@@ -510,9 +519,9 @@ impl GpuContext {
         Ok(results)
     }
 
-    /// Run batch PSO with three seeds and return the best fit per source
-    /// (matching the CPU and CUDA paths).
-    pub fn batch_pso_multi_seed<S: AsRef<SourceData>>(
+    /// Run batch PSO with three seeds and return the best fit per source,
+    /// judged by the PSO cost (matching the CPU and CUDA paths).
+    pub fn batch_pso_multi_seed<S: AsRef<SourceData> + Sync>(
         &self,
         data: &GpuBatchData,
         sources: &[S],
@@ -528,7 +537,7 @@ impl GpuContext {
                 Some(prev) => prev
                     .into_iter()
                     .zip(results)
-                    .map(|(a, b)| if b.reduced_chi2 < a.reduced_chi2 { b } else { a })
+                    .map(|(a, b)| if b.cost < a.cost { b } else { a })
                     .collect(),
             });
         }

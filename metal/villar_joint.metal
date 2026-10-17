@@ -142,9 +142,10 @@ kernel void batch_pso_cost_villar_joint(
             return;
         }
 
+        // Gaussian -2 ln L minus the constant ln(flux_err^2); see pso_cost in lib.rs.
         float sigma2  = all_flux_err_sq[i] + extra_sig * extra_sig;
         float diff    = all_flux[i] - model;
-        float contrib = diff * diff / sigma2;
+        float contrib = diff * diff / sigma2 + log(sigma2 / all_flux_err_sq[i]);
 
         if (band == 0) kahan_add(ll_r, ll_r_c, contrib);
         else           kahan_add(ll_g, ll_g_c, contrib);
